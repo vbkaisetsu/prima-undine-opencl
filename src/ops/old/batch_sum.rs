@@ -1,0 +1,104 @@
+use std::sync::Mutex;
+
+use ocl::enums::KernelWorkGroupInfo::CompileWorkGroupSize;
+use ocl::enums::KernelWorkGroupInfoResult::CompileWorkGroupSize as CompileWorkGroupSizeResult;
+use ocl::Buffer;
+use ocl::Kernel;
+use ocl::Program;
+use ocl::Queue;
+
+use prima_undine::device_impl::FunctionFwImpl;
+use prima_undine::Tensor;
+
+pub struct BatchSumFwImpl {
+    kernel: Mutex<Kernel>,
+    wgs_x: u32,
+}
+
+impl BatchSumFwImpl {
+    pub fn new(program: &Program, queue: Queue) -> BatchSumFwImpl {
+        let device = queue.device();
+        let kernel = Kernel::builder()
+            .program(program)
+            .name("batch_sum_fw_kernel")
+            .queue(queue)
+            .arg(None::<&Buffer<f32>>)
+            .arg(0)
+            .arg(0)
+            .arg(None::<&Buffer<f32>>)
+            .build()
+            .unwrap();
+        match kernel.wg_info(device, CompileWorkGroupSize).unwrap() {
+            CompileWorkGroupSizeResult([wgs_x, _, _]) => BatchSumFwImpl {
+                kernel: Mutex::new(kernel),
+                wgs_x: wgs_x as u32,
+            },
+            _ => panic!(),
+        }
+    }
+}
+
+impl FunctionFwImpl for BatchSumFwImpl {
+    fn call(&self, xs: &[&Tensor], _u32data: &[u32], _f32data: &[f32], ys: &mut [&mut Tensor]) {
+        let x = xs[0];
+        let y = &mut ys[0];
+        let size = y.shape().size();
+        let batch = x.shape().batch();
+        let g1 = super::calc_num_blocks(size, self.wgs_x);
+        let kernel = self.kernel.lock().unwrap();
+        unsafe {
+            kernel.set_arg(0, buffer!(x)).unwrap();
+            kernel.set_arg(1, size).unwrap();
+            kernel.set_arg(2, batch).unwrap();
+            kernel.set_arg(3, buffer!(y)).unwrap();
+            kernel
+                .cmd()
+                .global_work_size([g1 * self.wgs_x, 1, 1])
+                .local_work_size([self.wgs_x, 1, 1])
+                .enq()
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::get_device;
+    use prima_undine::shape;
+    use prima_undine::Shape;
+
+    #[test]
+    fn batch_sum_fw_test() {
+        struct TestCase(Shape, Vec<f32>, Shape, Vec<f32>);
+        let test_cases = vec![
+            TestCase(
+                shape![2, 3; 3],
+                vec![
+                    -9., -8., -7., -6., -5., -4., -3., -2., -1., 0., 1., 2., 3., 4., 5., 6., 7., 8.,
+                ],
+                shape![2, 3],
+                vec![-9., -6., -3., 0., 3., 6.],
+            ),
+            TestCase(
+                shape![2, 3; 2],
+                vec![-6., -5., -4., -3., -2., -1., 0., 1., 2., 3., 4., 5.],
+                shape![2, 3],
+                vec![-6., -4., -2., 0., 2., 4.],
+            ),
+            TestCase(
+                shape![2, 3],
+                vec![-6., -5., -4., -3., -2., -1.],
+                shape![2, 3],
+                vec![-6., -5., -4., -3., -2., -1.],
+            ),
+        ];
+        let dev = get_device();
+        for tc in &test_cases {
+            let x = dev.new_tensor_by_slice(tc.0, &tc.1);
+            let mut y = dev.new_tensor(tc.2);
+            y.alloc();
+            dev.call_fw_impl("batch_sum_fw_impl", &[&x], &[], &[], &mut [&mut y]);
+            assert_vector_ulps_eq!(&tc.3, &y.to_vec());
+        }
+    }
+}

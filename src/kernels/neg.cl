@@ -1,0 +1,1 @@
+OPENCLDEV_KERNEL_FW_X(neg, -px[i])
